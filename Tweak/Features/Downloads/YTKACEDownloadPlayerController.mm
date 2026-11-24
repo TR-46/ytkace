@@ -140,7 +140,23 @@ static NSArray<YTKACESubtitleCue *> *YTKACEReadSubtitles(NSURL *mediaURL) {
 @property(nonatomic, copy, readwrite, nullable) NSDictionary<NSString *, id> *promptedSegment;
 @property(nonatomic, strong) NSMutableSet<NSNumber *> *handledSegments;
 @property(nonatomic, strong, nullable) NSArray *remoteTargets;
+// What the person last asked for. A pause they did not ask for (an audio
+// session YouTube deactivated while backgrounding) leaves this YES, so the
+// session can resume; their own pauses, the end of a video and unplugged
+// headphones set it to NO.
+@property(nonatomic, assign) BOOL wantsPlayback;
+@property(nonatomic, assign) BOOL audioInterrupted;
+@property(nonatomic, assign) BOOL resumeAfterInterruption;
+@property(nonatomic, assign) BOOL inBackground;
+@property(nonatomic, assign) NSUInteger backgroundRecoveries;
+@property(nonatomic, assign) CFAbsoluteTime recoveryWindowStart;
+@property(nonatomic, assign) CFAbsoluteTime lastStallTime;
+@property(nonatomic, assign) BOOL lastStallWanted;
 @end
+
+static void *YTKACEPlaybackStatusContext = &YTKACEPlaybackStatusContext;
+static const NSUInteger YTKACEMaxBackgroundRecoveries = 3;
+static const CFTimeInterval YTKACERecoveryWindow = 30.0;
 
 @implementation YTKACEDownloadPlaybackSession
 
@@ -191,6 +207,22 @@ static YTKACEDownloadPlaybackSession *YTKACESharedPlaybackSession;
     [NSNotificationCenter.defaultCenter addObserver:self
         selector:@selector(downloadInfoChanged:)
         name:YTKACEDownloadInfoDidChangeNotification object:nil];
+    [NSNotificationCenter.defaultCenter addObserver:self
+        selector:@selector(applicationWillEnterForeground:)
+        name:UIApplicationWillEnterForegroundNotification object:nil];
+    AVAudioSession *audioSession = AVAudioSession.sharedInstance;
+    [NSNotificationCenter.defaultCenter addObserver:self
+        selector:@selector(audioSessionInterrupted:)
+        name:AVAudioSessionInterruptionNotification object:audioSession];
+    [NSNotificationCenter.defaultCenter addObserver:self
+        selector:@selector(audioRouteChanged:)
+        name:AVAudioSessionRouteChangeNotification object:audioSession];
+    [NSNotificationCenter.defaultCenter addObserver:self
+        selector:@selector(mediaServicesWereReset:)
+        name:AVAudioSessionMediaServicesWereResetNotification object:audioSession];
+    [self.player addObserver:self forKeyPath:@"timeControlStatus"
+                     options:NSKeyValueObservingOptionNew
+                     context:YTKACEPlaybackStatusContext];
     return self;
 }
 
@@ -415,10 +447,20 @@ static void YTKACEStoreCompleted(NSURL *URL, NSTimeInterval duration,
 
 - (void)configureAudioSession {
     AVAudioSession *session = AVAudioSession.sharedInstance;
-    [session setCategory:AVAudioSessionCategoryPlayback
-                    mode:AVAudioSessionModeMoviePlayback
-                 options:0 error:nil];
-    [session setActive:YES error:nil];
+    NSError *error = nil;
+    if (![session.category isEqualToString:AVAudioSessionCategoryPlayback] ||
+        ![session.mode isEqualToString:AVAudioSessionModeMoviePlayback] ||
+        session.categoryOptions != 0) {
+        if (![session setCategory:AVAudioSessionCategoryPlayback
+                             mode:AVAudioSessionModeMoviePlayback
+                          options:0 error:&error]) {
+            YTKACEDownloadLog(@"library", @"audio category failed %@", error.localizedDescription ?: @"-");
+        }
+    }
+    error = nil;
+    if (![session setActive:YES error:&error]) {
+        YTKACEDownloadLog(@"library", @"audio session activate failed %@", error.localizedDescription ?: @"-");
+    }
 }
 
 - (void)configureRemoteCommands {
@@ -495,8 +537,18 @@ static void YTKACEStoreCompleted(NSURL *URL, NSTimeInterval duration,
     [self rememberPosition];
 }
 
+- (void)applicationWillEnterForeground:(NSNotification *)notification {
+    (void)notification;
+    self.inBackground = NO;
+    self.backgroundRecoveries = 0;
+}
+
 - (void)applicationDidEnterBackground:(NSNotification *)notification {
     (void)notification;
+    self.inBackground = YES;
+    self.backgroundRecoveries = 0;
+    self.recoveryWindowStart = CFAbsoluteTimeGetCurrent();
+    if (self.currentURL != nil && self.wantsPlayback) [self configureAudioSession];
     if (!self.continueInBackground || self.currentURL == nil) return;
     [self configureAudioSession];
     [self.player play];
@@ -504,7 +556,161 @@ static void YTKACEStoreCompleted(NSURL *URL, NSTimeInterval duration,
     [self updateNowPlayingInfo];
 }
 
+- (void)observeValueForKeyPath:(NSString *)keyPath
+                      ofObject:(id)object
+                        change:(NSDictionary<NSKeyValueChangeKey, id> *)change
+                       context:(void *)context {
+    if (context != YTKACEPlaybackStatusContext) {
+        [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{ [self playbackStatusChanged]; });
+}
+
+// Locked, in the background, or on the way there (Control Center and the lock
+// screen first make the app inactive).
+- (BOOL)appIsInactive {
+    return self.inBackground ||
+        UIApplication.sharedApplication.applicationState != UIApplicationStateActive;
+}
+
+- (void)playbackStatusChanged {
+    if (self.currentURL == nil) return;
+    if (self.player.timeControlStatus == AVPlayerTimeControlStatusPlaying) {
+        // Keeps the lock screen's play/pause state and scrubber in step.
+        [self updateNowPlayingInfo];
+        return;
+    }
+    if (self.player.timeControlStatus != AVPlayerTimeControlStatusPaused) return;
+    self.lastStallTime = CFAbsoluteTimeGetCurrent();
+    self.lastStallWanted = self.wantsPlayback;
+    if (!self.wantsPlayback || self.audioInterrupted) return;
+    if ([YTKACELibraryPiP sharedPiP].active) {
+        // The PiP window's own pause button stops the player directly.
+        self.wantsPlayback = NO;
+        return;
+    }
+    if (![self appIsInactive]) {
+        // In the app, a pause comes from the person or the player itself.
+        // Wait a moment: an interruption (a call, Siri) or a lock that is
+        // about to begin must not be mistaken for one.
+        __weak YTKACEDownloadPlaybackSession *weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            YTKACEDownloadPlaybackSession *strongSelf = weakSelf;
+            if (strongSelf == nil || strongSelf.audioInterrupted || [strongSelf appIsInactive] ||
+                strongSelf.player.timeControlStatus != AVPlayerTimeControlStatusPaused) return;
+            strongSelf.wantsPlayback = NO;
+        });
+        return;
+    }
+    [self scheduleBackgroundRecovery];
+}
+
+// The screen locked or the app went to the background while a download was
+// playing, and something other than the person stopped it: usually YouTube
+// deactivating the shared audio session for its own player. Take the
+// session back and continue, a few times at most so two players never fight.
+- (void)scheduleBackgroundRecovery {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - self.recoveryWindowStart > YTKACERecoveryWindow) {
+        self.recoveryWindowStart = now;
+        self.backgroundRecoveries = 0;
+    }
+    if (self.backgroundRecoveries >= YTKACEMaxBackgroundRecoveries) {
+        YTKACEDownloadLog(@"library", @"background recovery limit reached");
+        return;
+    }
+    self.backgroundRecoveries++;
+    NSURL *URL = self.currentURL;
+    __weak YTKACEDownloadPlaybackSession *weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        YTKACEDownloadPlaybackSession *strongSelf = weakSelf;
+        if (strongSelf == nil || ![strongSelf.currentURL isEqual:URL] ||
+            ![strongSelf appIsInactive] || !strongSelf.wantsPlayback ||
+            strongSelf.audioInterrupted || [YTKACELibraryPiP sharedPiP].active ||
+            strongSelf.player.timeControlStatus != AVPlayerTimeControlStatusPaused) {
+            return;
+        }
+        AVPlayerItem *item = strongSelf.player.currentItem;
+        NSTimeInterval duration = CMTimeGetSeconds(item.duration);
+        NSTimeInterval position = CMTimeGetSeconds(item.currentTime);
+        if (item.status != AVPlayerItemStatusReadyToPlay ||
+            (isfinite(duration) && isfinite(position) && position >= duration - 0.5)) {
+            return;
+        }
+        YTKACEDownloadLog(@"library", @"background recovery %lu",
+                          (unsigned long)strongSelf.backgroundRecoveries);
+        [strongSelf configureAudioSession];
+        [strongSelf.player play];
+        strongSelf.player.rate = MAX(0.25f, MIN(strongSelf.playbackRate, 5.0f));
+        [strongSelf updateNowPlayingInfo];
+    });
+}
+
+- (void)audioSessionInterrupted:(NSNotification *)notification {
+    NSDictionary *info = notification.userInfo;
+    AVAudioSessionInterruptionType type =
+        (AVAudioSessionInterruptionType)[info[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
+    AVAudioSessionInterruptionOptions options =
+        (AVAudioSessionInterruptionOptions)[info[AVAudioSessionInterruptionOptionKey] unsignedIntegerValue];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.currentURL == nil) return;
+        if (type == AVAudioSessionInterruptionTypeBegan) {
+            BOOL recentStall = CFAbsoluteTimeGetCurrent() - self.lastStallTime < 2.0;
+            self.resumeAfterInterruption = self.wantsPlayback || (recentStall && self.lastStallWanted);
+            self.audioInterrupted = YES;
+            [self rememberPosition];
+            YTKACEDownloadLog(@"library", @"audio interruption began resume=%d",
+                              self.resumeAfterInterruption);
+            [self notifyChange];
+            return;
+        }
+        self.audioInterrupted = NO;
+        BOOL resume = self.resumeAfterInterruption &&
+            (options & AVAudioSessionInterruptionOptionShouldResume) != 0;
+        self.resumeAfterInterruption = NO;
+        YTKACEDownloadLog(@"library", @"audio interruption ended resume=%d", resume);
+        if (resume) {
+            [self play];
+        } else {
+            self.wantsPlayback = NO;
+            [self notifyChange];
+        }
+    });
+}
+
+- (void)audioRouteChanged:(NSNotification *)notification {
+    AVAudioSessionRouteChangeReason reason = (AVAudioSessionRouteChangeReason)
+        [notification.userInfo[AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue];
+    if (reason != AVAudioSessionRouteChangeReasonOldDeviceUnavailable) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.currentURL == nil) return;
+        // Headphones or a Bluetooth device went away: the system pauses, as it
+        // should, and backgrounding must not start the speaker instead.
+        self.wantsPlayback = NO;
+        [self rememberPosition];
+        [self notifyChange];
+    });
+}
+
+- (void)mediaServicesWereReset:(NSNotification *)notification {
+    (void)notification;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.currentURL == nil) return;
+        YTKACEDownloadLog(@"library", @"media services reset");
+        [self releaseRemoteCommands];
+        [self configureAudioSession];
+        [self configureRemoteCommands];
+        if (self.wantsPlayback) [self play];
+        else [self notifyChange];
+    });
+}
+
 - (void)dealloc {
+    [self.player removeObserver:self forKeyPath:@"timeControlStatus"
+                        context:YTKACEPlaybackStatusContext];
     [self rememberPosition];
     if (self.resumeObserver != nil) {
         [self.player removeTimeObserver:self.resumeObserver];
@@ -660,6 +866,7 @@ static void YTKACEStoreCompleted(NSURL *URL, NSTimeInterval duration,
 }
 
 - (void)play {
+    self.wantsPlayback = YES;
     YTKACEPauseYouTubePlayer();
     [self configureAudioSession];
     [self configureRemoteCommands];
@@ -671,6 +878,7 @@ static void YTKACEStoreCompleted(NSURL *URL, NSTimeInterval duration,
 }
 
 - (void)pause {
+    self.wantsPlayback = NO;
     [self rememberPosition];
     [self.player pause];
     [self notifyChange];
@@ -735,6 +943,7 @@ static void YTKACEStoreCompleted(NSURL *URL, NSTimeInterval duration,
 }
 
 - (void)stop {
+    self.wantsPlayback = NO;
     [self.player pause];
     [self.player replaceCurrentItemWithPlayerItem:nil];
     self.currentURL = nil;
