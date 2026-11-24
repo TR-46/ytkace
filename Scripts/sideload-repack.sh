@@ -42,6 +42,11 @@ MAIN="$APP/$EXECUTABLE"
 rm -rf "$APP/YTKACE.bundle"
 rm -rf "$APP/Extensions/AppMigrationExtension.appex"
 rm -rf "$APP/_CodeSignature"
+# Purchase records name the Apple Account that bought the app; a personal
+# build has no use for them, so they never reach the output IPA.
+rm -rf "$APP/SC_Info"
+find "$APP" -name 'SC_Info' -type d -prune -exec rm -rf {} +
+rm -f "$WORK/iTunesMetadata.plist" "$WORK/iTunesArtwork"
 find "$APP" -maxdepth 1 -type f \( -name 'YTK@*' -o -name 'YTK-*' \) -delete
 python3 "$ROOT/Tools/sanitize_plist.py" "$APP/Info.plist"
 

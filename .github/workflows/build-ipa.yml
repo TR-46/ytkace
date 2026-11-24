@@ -133,6 +133,10 @@ jobs:
             bash Scripts/sideload-repack.sh YouTube.ipa deb-root/var/jb/Library/MobileSubstrate/DynamicLibraries/YTKACE.dylib "$output"
           bash Tools/verify-artifacts.sh deb-root/var/jb/Library/MobileSubstrate/DynamicLibraries/YTKACE.dylib "$output"
           unzip -l "$output" | grep -q 'PlugIns/OpenInYTKACE.appex/OpenInYTKACE$'
+          if unzip -l "$output" | grep -Eq 'SC_Info/|iTunesMetadata\.plist'; then
+            echo "::error::Apple Account purchase data is still in the IPA. Stopping."
+            exit 1
+          fi
           shasum -a 256 "$output" > "$output.sha256"
           {
             echo "### Output"
