@@ -1,17 +1,22 @@
 name: IPA
 
+# Personal build. You supply the decrypted YouTube IPA yourself (for iOS 26,
+# YouTube 21.47.6 or newer) and its SHA-256; the run stops if the file does
+# not match. There is no default download: no third-party IPA is ever fetched.
+#
+# This fork is public, so workflow inputs and logs are public too. Use a
+# download link that expires, and never put a password or token in the URL.
+
 on:
   workflow_dispatch:
     inputs:
       ipa_url:
-        description: YouTube IPA URL (iOS 16 base, 21.33.6)
+        description: Direct link to your own decrypted YouTube IPA
         required: true
-        default: "https://www.dropbox.com/scl/fi/1m7rq3lpkg3mfsone2299/com.google.ios.youtube-21.33.6-eeveedecrypter.ipa?rlkey=b2nsvre89881puprynwkfau8q&st=4fkh7ry8&dl=1"
         type: string
-      ipa_url_ios17:
-        description: Second YouTube IPA URL (iOS 17+ base, 21.47.6). Leave empty to build one IPA.
-        required: false
-        default: "https://www.dropbox.com/scl/fi/0pa15ymo1crqoh37ua14v/com.google.ios.youtube-21.47.6-eeveedecrypter.ipa?rlkey=q66okvz57iox2harvkra17cij&st=kj9fensp&dl=1"
+      ipa_sha256:
+        description: SHA-256 of that IPA (64 hex characters)
+        required: true
         type: string
 
 permissions:
@@ -21,69 +26,92 @@ jobs:
   build:
     uses: ./.github/workflows/build-deb.yml
 
-  plan:
-    runs-on: ubuntu-latest
-    outputs:
-      targets: ${{ steps.targets.outputs.targets }}
+  package:
+    needs: build
+    runs-on: macos-latest
     steps:
-      - name: Collect IPA bases
-        id: targets
+      - name: Hide the download link in logs
         env:
           IPA_URL: ${{ inputs.ipa_url }}
-          IPA_URL_IOS17: ${{ inputs.ipa_url_ios17 }}
-        run: |
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
-          import os
+        run: echo "::add-mask::$IPA_URL"
 
-          targets = [{"label": "ios16", "url": os.environ["IPA_URL"]}]
-          second = os.environ.get("IPA_URL_IOS17", "").strip()
-          if second:
-              targets.append({"label": "ios17", "url": second})
-          print("targets=" + json.dumps(targets))
-          PY
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
-  package:
-    needs: [build, plan]
-    runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target: ${{ fromJSON(needs.plan.outputs.targets) }}
-    steps:
-      - uses: actions/checkout@v6
-
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: YTKACE-deb-rootless
           path: packages
 
-      - uses: levibostian/action-hide-sensitive-inputs@v1
-
       - name: Setup
         run: brew install ldid dpkg
 
-      - name: YouTube
+      - name: Download and verify YouTube
         env:
-          IPA_URL: ${{ matrix.target.url }}
-          GH_TOKEN: ${{ github.token }}
+          IPA_URL: ${{ inputs.ipa_url }}
+          IPA_SHA256: ${{ inputs.ipa_sha256 }}
         run: |
-          if [[ "$IPA_URL" == "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/"* ]]; then
-            curl --fail --location \
-              --header "Accept: application/octet-stream" \
-              --header "Authorization: Bearer $GH_TOKEN" \
-              "$IPA_URL" --output YouTube.ipa
-          else
-            curl --fail --location "$IPA_URL" --output YouTube.ipa
-          fi
-          file_type=$(file --mime-type -b YouTube.ipa)
-          if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
+          set -euo pipefail
+          expected="$(printf '%s' "$IPA_SHA256" | tr 'A-F' 'a-f' | tr -d '[:space:]')"
+          if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::ipa_sha256 must be 64 hex characters"
             exit 1
           fi
+          curl --fail --location --silent --show-error "$IPA_URL" --output YouTube.ipa
+          actual="$(shasum -a 256 YouTube.ipa | awk '{print $1}')"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::SHA-256 mismatch: got $actual, expected $expected. Stopping."
+            exit 1
+          fi
+          echo "Base IPA SHA-256 verified: $actual"
+          file_type=$(file --mime-type -b YouTube.ipa)
+          if [[ "$file_type" != "application/x-ios-app" && "$file_type" != "application/zip" ]]; then
+            echo "::error::Not an IPA ($file_type)"
+            exit 1
+          fi
+
+      - name: Check the base IPA
+        run: |
+          set -euo pipefail
+          mkdir base && unzip -q YouTube.ipa -d base
+          app="$(find base/Payload -mindepth 1 -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "$app"
+          bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")"
+          if [[ "$bundle_id" != "com.google.ios.youtube" ]]; then
+            echo "::error::Unexpected bundle id $bundle_id. Stopping."
+            exit 1
+          fi
+          # A dylib or framework that is not part of YouTube means the IPA was
+          # already modified by someone else.
+          if find "$app" -name '*.dylib' -not -path '*/Frameworks/libswift*' | grep -q .; then
+            echo "::error::The base IPA already contains injected dylibs:"
+            find "$app" -name '*.dylib' -not -path '*/Frameworks/libswift*'
+            exit 1
+          fi
+          for name in CydiaSubstrate.framework Cephei.framework; do
+            if [[ -e "$app/Frameworks/$name" ]]; then
+              echo "::error::The base IPA already contains $name. Stopping."
+              exit 1
+            fi
+          done
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")"
+          if otool -l "$app/$executable" | awk '/LC_ENCRYPTION_INFO/ {f=1} f && /cryptid/ {print $2; exit}' | grep -qv '^0$'; then
+            echo "::error::The YouTube executable is still encrypted (cryptid != 0). Decrypt it first."
+            exit 1
+          fi
+          {
+            echo "### Base IPA"
+            echo "- Bundle: \`$bundle_id\`"
+            echo "- YouTube: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Info.plist")"
+            echo "- Minimum iOS: $(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$app/Info.plist")"
+          } >> "$GITHUB_STEP_SUMMARY"
+          rm -rf base
 
       - name: Inject
         id: inject
         run: |
+          set -euo pipefail
           mkdir deb-root
           dpkg-deb -x packages/*.deb deb-root
           export LDID="$(brew --prefix)/bin/ldid"
@@ -98,21 +126,28 @@ jobs:
               print(plistlib.loads(archive.read(info))['CFBundleShortVersionString'])
           PY
           )"
-          if [ "${{ matrix.target.label }}" = "ios16" ]; then
-            output="YTKACE_${tweak_version}_YouTube_iOS16_${youtube_version}.ipa"
-          else
-            output="YTKACE_${tweak_version}_YouTube_${youtube_version}.ipa"
-          fi
+          output="YTKACE_${tweak_version}_YouTube_${youtube_version}_personal.ipa"
           # Open in YTKACE Safari extension, off until turned on in Settings.
           bash Scripts/build-safari-extension.sh safari-extension iphoneos
           SAFARI_EXTENSION_APPEX=safari-extension/OpenInYTKACE.appex \
             bash Scripts/sideload-repack.sh YouTube.ipa deb-root/var/jb/Library/MobileSubstrate/DynamicLibraries/YTKACE.dylib "$output"
           bash Tools/verify-artifacts.sh deb-root/var/jb/Library/MobileSubstrate/DynamicLibraries/YTKACE.dylib "$output"
           unzip -l "$output" | grep -q 'PlugIns/OpenInYTKACE.appex/OpenInYTKACE$'
+          shasum -a 256 "$output" > "$output.sha256"
+          {
+            echo "### Output"
+            echo '```'
+            cat "$output.sha256"
+            echo '```'
+            echo "Size: $(stat -f %z "$output") bytes"
+          } >> "$GITHUB_STEP_SUMMARY"
           echo "ipa=$output" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: YTKACE-IPA-${{ matrix.target.label }}
-          path: ${{ steps.inject.outputs.ipa }}
+          name: YTKACE-IPA-personal
+          path: |
+            ${{ steps.inject.outputs.ipa }}
+            ${{ steps.inject.outputs.ipa }}.sha256
           if-no-files-found: error
+          retention-days: 7

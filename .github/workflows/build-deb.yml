@@ -9,11 +9,24 @@ on:
 permissions:
   contents: read
 
+# Every download below is pinned: third-party actions to a commit, Theos to a
+# commit (its submodules follow that commit), and the toolchain and SDK
+# archives to a release plus a SHA-256 that the build checks before use.
+env:
+  THEOS_REPO: https://github.com/roothide/theos.git
+  THEOS_COMMIT: 958fea4f779943505b15b93c88bb4db8d97b346d
+  TOOLCHAIN_URL: https://github.com/L1ghtmann/llvm-project/releases/download/test-210562a/iOSToolchain-x86_64.tar.xz
+  TOOLCHAIN_SHA256: a72a7a577e2fbe2838b6b5e9c72034fa7d114af96f0e1d4b016f18730ce4056e
+  SDK_URL: https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS16.5.sdk.tar.xz
+  SDK_SHA256: 5e0fd3f01266cce4ce012d4a99b38eb56578fca40d09edc81cd83dee958202fb
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - name: Test
         run: python3 -m unittest discover -s Tests -v
 
@@ -32,20 +45,41 @@ jobs:
       THEOS: ${{ github.workspace }}/.theos
       CI: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot rsync curl perl zip git libxml2 libtinfo6
 
       - name: Cache Theos
         id: cache-theos
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ${{ github.workspace }}/.theos
-          key: roothide-theos-${{ runner.os }}-v1
+          key: theos-${{ runner.os }}-${{ env.THEOS_COMMIT }}-${{ env.TOOLCHAIN_SHA256 }}-${{ env.SDK_SHA256 }}
 
-      - name: Setup
+      - name: Setup Theos (pinned)
         if: steps.cache-theos.outputs.cache-hit != 'true'
-        run: bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone --no-checkout "$THEOS_REPO" "$THEOS"
+          git -C "$THEOS" checkout --quiet "$THEOS_COMMIT"
+          git -C "$THEOS" submodule update --init --recursive
+          test "$(git -C "$THEOS" rev-parse HEAD)" = "$THEOS_COMMIT"
+
+          mkdir -p "$RUNNER_TEMP/theos-dl" "$THEOS/toolchain" "$THEOS/sdks"
+          curl -fsSL "$TOOLCHAIN_URL" -o "$RUNNER_TEMP/theos-dl/toolchain.tar.xz"
+          echo "$TOOLCHAIN_SHA256  $RUNNER_TEMP/theos-dl/toolchain.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/theos-dl/toolchain.tar.xz" -C "$THEOS/toolchain"
+
+          curl -fsSL "$SDK_URL" -o "$RUNNER_TEMP/theos-dl/sdk.tar.xz"
+          echo "$SDK_SHA256  $RUNNER_TEMP/theos-dl/sdk.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/theos-dl/sdk.tar.xz" -C "$THEOS/sdks"
+
+          test -x "$THEOS/toolchain/linux/iphone/bin/clang"
 
       - name: Build
         run: |
@@ -57,15 +91,33 @@ jobs:
       - name: Name package
         id: name
         run: |
+          set -euo pipefail
           deb="$(ls packages/*.deb | head -1)"
           version="$(awk '/^Version:/ {print $2}' control)"
           output="com.itzzace.ytkace_${version}_${{ matrix.suffix }}.deb"
           mkdir -p artifacts
           cp "$deb" "artifacts/$output"
+          cp dist/YTKACE.dylib "artifacts/YTKACE_${version}_${{ matrix.suffix }}.dylib"
+          (cd artifacts && sha256sum * > SHA256SUMS.txt)
+          {
+            echo "### YTKACE ${version} (${{ matrix.suffix }})"
+            echo '```'
+            cat artifacts/SHA256SUMS.txt
+            echo '```'
+            ls -l artifacts | awk 'NR>1 {print $5, $9}'
+          } >> "$GITHUB_STEP_SUMMARY"
           echo "deb=artifacts/$output" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: YTKACE-deb-${{ matrix.suffix }}
           path: ${{ steps.name.outputs.deb }}
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: YTKACE-dylib-${{ matrix.suffix }}
+          path: |
+            artifacts/*.dylib
+            artifacts/SHA256SUMS.txt
           if-no-files-found: error
