@@ -2,7 +2,7 @@ name: Deb
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'personal/**']
   workflow_dispatch:
   workflow_call:
 
